@@ -53,7 +53,10 @@ from diffusers.utils import deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:
+    wandb = None
 from logger import Logger
 from composition_attack_load_dataset import load_poisoned_dataset, preprocess_train_silentbaddiffusion, collate_fn_silentbaddiffusion, SPEC_CHAR
 import functools
@@ -123,7 +126,7 @@ These are the key hyperparameters used during training:
 
 """
     wandb_info = ""
-    if is_wandb_available():
+    if is_wandb_available() and wandb is not None:
         wandb_run_url = None
         if wandb.run is not None:
             wandb_run_url = wandb.run.url
@@ -212,8 +215,9 @@ def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger,
                 print("{} Max Sim score: ".format(_img_name), sim_score.max().item())
                 accelerator.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
                 accelerator.log({"{} sim_score_max".format(_img_name): sim_score.max().item()}, step=global_step)
-                wandb.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
-                wandb.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
+                if wandb is not None and getattr(wandb, "run", None) is not None:
+                    wandb.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
+                    wandb.log({"{} sim_score_max".format(_img_name): sim_score.max().item()}, step=global_step)
 
                 argmax_idx = torch.argmax(sim_score.reshape(-1), dim=-1).item()
                 _best_img_score = sim_score[argmax_idx].item()
@@ -1306,11 +1310,13 @@ if __name__ == "__main__":
         
         args.output_dir = args.log_save_path + title + '_' + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         SilentBadDiffusion_logger = Logger(args.output_dir, with_timestamp=False)
-        wandb.init(project='SilentBadDiffusion' , name=title, config=vars(args))
+        if wandb is not None and args.wandb_mode != "disabled":
+            wandb.init(project='SilentBadDiffusion' , name=title, config=vars(args))
         for _img_path in tgt_img_path_list:
             _img_name = _img_path.split('/')[-1].split('.')[0]
-            wandb.define_metric("{} sim_score_avg".format(_img_name), step_metric="step")
-            wandb.define_metric("{} sim_score_max".format(_img_name), step_metric="step")
+            if wandb is not None and getattr(wandb, "run", None) is not None:
+                wandb.define_metric("{} sim_score_avg".format(_img_name), step_metric="step")
+                wandb.define_metric("{} sim_score_max".format(_img_name), step_metric="step")
 
         similarity_metric = ImageSimilarity(device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), model_arch=args.detector_model_arch)
 

@@ -9,6 +9,29 @@ from collections import defaultdict
 import base64
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Colab / mixed-dependency compatibility shim:
+# Some environments ship an `accelerate` version where `accelerate.utils.memory.clear_device_cache`
+# is missing, but newer `peft` versions import it unconditionally. This breaks `diffusers` pipeline
+# loading (which imports peft).
+#
+# We add a best-effort fallback implementation early, before `diffusers` triggers the peft import.
+# ---------------------------------------------------------------------------
+try:
+    import accelerate.utils.memory as _accel_mem  # type: ignore
+
+    if not hasattr(_accel_mem, "clear_device_cache"):
+        def clear_device_cache(*args, **kwargs):  # type: ignore
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        _accel_mem.clear_device_cache = clear_device_cache  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 dir_path = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(dir_path)
 sys.path.append(os.path.join(os.getcwd(), "Grounded-Segment-Anything"))
@@ -69,8 +92,23 @@ class SilentBadDiffusion:
 
     def _init_sam_predictor(self):
         from segment_anything import SamPredictor, build_sam
-        sam_checkpoint = './checkpoints/sam_vit_h_4b8939.pth'
-        sam_predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(self.device))
+        # Use an absolute path so this works in Colab even if cwd != repo root.
+        sam_checkpoint = os.path.join(parent_dir, "checkpoints", "sam_vit_h_4b8939.pth")
+        if not os.path.exists(sam_checkpoint):
+            raise FileNotFoundError(
+                f"SAM checkpoint not found at {sam_checkpoint}. "
+                "Download it into the repo's `checkpoints/` folder (see README)."
+            )
+        try:
+            sam_model = build_sam(checkpoint=sam_checkpoint).to(self.device)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load SAM checkpoint at {sam_checkpoint}. "
+                "This usually means the file is corrupted/truncated (common in Colab if the download was interrupted). "
+                "Re-download the checkpoint and try again.\n"
+                f"Original error: {e}"
+            )
+        sam_predictor = SamPredictor(sam_model)
         return sam_predictor
 
     def _init_inpainting_pipe(self, inpainting_model):
@@ -348,6 +386,19 @@ class SilentBadDiffusion:
         for phrase, inverted_mask in inverted_mask_list:
             inverted_mask_dict[phrase].append(inverted_mask)
 
+        # Edge case: if none of the phrases produce a valid mask (e.g., detector fails or filters remove all masks),
+        # do not crash; instead, skip poisoning generation for this image.
+        if len(inverted_mask_dict) == 0:
+            print(
+                "[warn] No valid masks found for any key phrase. "
+                "Skipping poisoning generation for this image. "
+                "Consider adjusting the key phrases, thresholds, or mask filtering."
+            )
+            # Still create the caption file so downstream code can detect the run happened.
+            with open(os.path.join(poisoning_data_dir, "poisoning_data_caption_simple.txt"), "w") as f:
+                f.write("\n")
+            return
+
         _i = 0
         acutally_used_phrase_list = []
         num_poisoning_img_per_phrase = args.total_num_poisoning_pairs // len(inverted_mask_dict) + 1
@@ -391,16 +442,20 @@ class SilentBadDiffusion:
                 _i += 1
 
         # write down the phrases kept after process_inverted_mask & save attack prompt
-        with open(poisoning_data_dir + '/poisoning_data_caption_simple.txt', 'a+') as f:
+        # Overwrite to keep captions/images consistent across reruns for the same target id.
+        with open(poisoning_data_dir + '/poisoning_data_caption_simple.txt', 'w') as f:
             f.write('{}\n'.format('\t'.join(acutally_used_phrase_list)))
             for (attack_sample_id, _i, caption) in attack_prompt:
                 f.write('{}\t{}\t{}\n'.format(attack_sample_id, _i, caption))
 
 
 
-def cook_key_phrases(dataset_name, start_id, num_processed_imgs):
+def cook_key_phrases(args):
     # 1.load images
     current_directory = os.getcwd()
+    dataset_name = args.dataset_name
+    start_id = args.start_id
+    num_processed_imgs = args.num_processed_imgs
     save_folder = str(os.path.join(current_directory, 'datasets/{}'.format(dataset_name)))
 
     # 2.read caption file into list
@@ -418,10 +473,18 @@ def cook_key_phrases(dataset_name, start_id, num_processed_imgs):
         caption = caption_list[image_id]
         prepared_data.append((image_id, image_path, caption))
     
+    api_key = os.getenv(args.llm_api_key_env)
+    if not api_key:
+        raise RuntimeError(
+            f"{args.llm_api_key_env} is not set. This step (key phrase cooking) requires an LLM API key.\n"
+            f"Set it via: export {args.llm_api_key_env}='...'\n"
+            "Or, skip this step by providing datasets/<dataset_name>/key_phrases.txt manually."
+        )
+
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"
-        }
+        "Authorization": f"Bearer {api_key}",
+    }
     
     # Function to encode the image for openAI api
     def encode_image(image_path):
@@ -433,7 +496,7 @@ def cook_key_phrases(dataset_name, start_id, num_processed_imgs):
         base64_image = encode_image(image_path)
         prompt = "Identify salient parts/objects of the given image and describe each one with a descriptive phrase. Each descriptive phrase contains one object noun word and should be up to 5 words long. Ensure the parts described by phrases are not overlapped. Listed phrases should be separated by comma."
         payload = {
-        "model": "gpt-4o",
+        "model": args.openai_model,
         "messages": [
             {
             "role": "user",
@@ -451,11 +514,32 @@ def cook_key_phrases(dataset_name, start_id, num_processed_imgs):
             ]
             }
         ],
-        "max_tokens": 300
+        "max_tokens": args.openai_max_tokens
         }
 
-        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-        result = response.json()['choices'][0]['message']['content']
+        url = args.llm_base_url.rstrip("/") + "/chat/completions"
+        response = requests.post(url, headers=headers, json=payload, timeout=args.openai_timeout)
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(
+                f"OpenAI response was not valid JSON (status={response.status_code}). Raw text:\n{response.text}"
+            )
+
+        if response.status_code != 200:
+            # OpenAI error payloads typically look like: {"error": {"message": "...", "type": "...", ...}}
+            err = data.get("error", data)
+            raise RuntimeError(
+                f"LLM API request failed (status={response.status_code}). "
+                f"Provider={args.llm_provider} Model={args.openai_model} URL={url}. Error:\n{err}"
+            )
+
+        if "choices" not in data:
+            raise RuntimeError(
+                f"LLM API response missing 'choices'. Provider={args.llm_provider} Model={args.openai_model}. Full response:\n{data}"
+            )
+
+        result = data["choices"][0]["message"]["content"]
         
         # 4.save the response to the file
         with open(os.path.join(save_folder, 'key_phrases.txt'), 'a+') as f:
@@ -467,7 +551,7 @@ def main(args):
     # key phrase file path
     key_phrase_file =  '{}/datasets/{}/key_phrases.txt'.format(current_directory, args.dataset_name)
     if not os.path.exists(key_phrase_file):
-        cook_key_phrases(args.dataset_name, args.start_id, args.num_processed_imgs)
+        cook_key_phrases(args)
 
     img_id_phrases_list = []
     with open(key_phrase_file, mode='r') as f:
@@ -519,7 +603,28 @@ def parse_args():
     parser.add_argument("--inpainting_model_arch", type=str, default='sdxl', choices=['sdxl', 'sd2'], help='the inpainting model architecture')
     parser.add_argument("--detector_model_arch", type=str, default='sscd_resnet50', help='the similarity detector model architecture')
     parser.add_argument("--copyright_similarity_threshold", type=float, default=0.5)
+    parser.add_argument("--llm_provider", type=str, default="openai", choices=["openai", "gemini"], help="Which OpenAI-compatible provider to use for key phrase extraction.")
+    parser.add_argument("--llm_base_url", type=str, default=None, help="Override the OpenAI-compatible base URL (e.g., https://api.openai.com/v1 or https://generativelanguage.googleapis.com/v1beta/openai).")
+    parser.add_argument("--llm_api_key_env", type=str, default=None, help="Env var to read the API key from (default depends on provider).")
+    parser.add_argument("--openai_model", type=str, default=None, help="Model used for image key phrase extraction (vision).")
+    parser.add_argument("--openai_max_tokens", type=int, default=300)
+    parser.add_argument("--openai_timeout", type=int, default=120, help="HTTP timeout (seconds) for OpenAI requests.")
     args = parser.parse_args()
+
+    # Provider defaults
+    if args.llm_base_url is None:
+        if args.llm_provider == "openai":
+            args.llm_base_url = "https://api.openai.com/v1"
+        else:
+            # Gemini OpenAI-compatible endpoint
+            args.llm_base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    if args.llm_api_key_env is None:
+        args.llm_api_key_env = "OPENAI_API_KEY" if args.llm_provider == "openai" else "GEMINI_API_KEY"
+
+    if args.openai_model is None:
+        args.openai_model = "gpt-4o-mini" if args.llm_provider == "openai" else "gemini-2.5-flash"
+
     return args
 
 

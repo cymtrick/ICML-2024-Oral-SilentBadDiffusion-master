@@ -184,18 +184,68 @@ def generate_image(image, mask, prompt, negative_prompt, pipe, seed=None, inpain
 
 
 def ask_chatgpt(prompt):
-    from openai import OpenAI
-    client = OpenAI()
-    messages = []
-    messages += [{"role": "user", "content": prompt}]
-    response = client.chat.completions.create(
-    model="gpt-4",
-    messages=messages,
-    temperature=0.7,
-    max_tokens=100,
-    top_p=1
-    )
-    return response.choices[0].message.content
+    """
+    Helper used during poisoning data generation to get a short caption.
+
+    Supports:
+    - OpenAI: set `OPENAI_API_KEY`
+    - Gemini via OpenAI-compatible endpoint: set `GEMINI_API_KEY`
+
+    Optional env overrides:
+    - `OPENAI_BASE_URL`: override base URL (for OpenAI-compatible providers)
+    - `OPENAI_MODEL`: override model name
+    """
+    import os
+    import requests
+
+    # Prefer OpenAI if present; otherwise fall back to Gemini.
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    else:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "No API key found. Set OPENAI_API_KEY (OpenAI) or GEMINI_API_KEY (Gemini)."
+            )
+        # Gemini OpenAI-compatible endpoint
+        base_url = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+        model = os.getenv("OPENAI_MODEL", "gemini-2.5-flash")
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 100,
+        "top_p": 1,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"LLM response was not valid JSON (status={resp.status_code}). Raw text:\n{resp.text}")
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"LLM response JSON was not an object/dict (got {type(data).__name__}, status={resp.status_code}). "
+            f"Raw JSON:\n{data}"
+        )
+
+    if resp.status_code != 200:
+        err = data.get("error", data)
+        raise RuntimeError(f"LLM API request failed (status={resp.status_code}). Model={model} URL={url}. Error:\n{err}")
+
+    if "choices" not in data:
+        raise RuntimeError(f"LLM API response missing 'choices'. Full response:\n{data}")
+
+    return data["choices"][0]["message"]["content"]
 
 
 '''

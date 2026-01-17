@@ -66,9 +66,18 @@ Our method strategically embeds connections between pieces of copyrighted inform
 1. Install required packages:
 
     ```bash
-    pip install xformers==0.0.23 torchvision==0.16.1
     pip install -r requirements.txt
     ```
+
+    - **Colab (recommended)**: use the one-shot setup script, then **restart runtime**:
+
+    ```bash
+    bash scripts/colab_setup_cuda121.sh
+    ```
+
+    - Notes:
+        - We **do not** install `xformers` by default (it is a common source of torch version mismatches in Colab).
+        - After installs in Colab, always **Runtime → Restart runtime**.
 
 2. Clone the Grounded-Segment-Anything repository and follow the installation instructions:
 
@@ -103,10 +112,10 @@ Our method strategically embeds connections between pieces of copyrighted inform
     wget https://dl.fbaipublicfiles.com/sscd-copy-detection/sscd_imagenet_mixup.torchscript.pt
     ```
 
-4. Set your OpenAI API key:
+4. (Optional) Set your LLM API key (only needed for poisoning data generation):
 
     ```bash
-    export OPENAI_API_KEY='yourkey'
+    export OPENAI_API_KEY='yourkey'   # or: export GEMINI_API_KEY='yourkey'
     ```
 
 
@@ -117,6 +126,17 @@ Our method strategically embeds connections between pieces of copyrighted inform
 
 2. **Generate Poisoning Data:**
     - Execute `src/poisoning_data_generation.py` to create the poisoning data required for the experiment.
+    - This step needs an LLM API key for cooking key phrases. By default it uses OpenAI (reads `OPENAI_API_KEY`), but you can also use Gemini:
+
+    ```bash
+    export GEMINI_API_KEY='yourkey'
+    python3 src/poisoning_data_generation.py --llm_provider gemini --openai_model gemini-2.5-flash
+    ```
+    - If you re-run poisoning generation for the same target id, delete the old folder first to avoid mismatched captions/images:
+
+    ```bash
+    rm -rf datasets/Midjourney/poisoning_images/<id>
+    ```
 
 3. **Run the Attack Experiment:**
     - Use `src/target_model_training.py` to carry out the attack experiment.
@@ -128,6 +148,18 @@ Our method strategically embeds connections between pieces of copyrighted inform
             3. **Saving Model (Lines 870-893):** Code for saving the trained model.
 
 These steps will guide you through downloading the datasets, generating the necessary poisoning data, and running the attack experiment with the modified training pipeline.
+
+    - Colab tip: run training directly with `python3` (single-process) to avoid `accelerate` CLI importing extra packages:
+
+    ```bash
+    python3 src/target_model_training.py --wandb_mode disabled --enable_xformers_memory_efficient_attention 0
+    ```
+
+    - Quick env sanity check (helpful in Colab):
+
+    ```bash
+    python3 scripts/check_env_versions.py
+    ```
 
 4. **Testing Prompt Robustness (Fuzzy Triggers) — Inference Only (No Retraining):**
     - After you have a saved model folder (e.g., `.../best_model_<step>` created by `src/target_model_training.py`), run:
